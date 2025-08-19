@@ -86,7 +86,9 @@ class ImportService:
             if not quiz_id:
                 quiz_id = self.repo.get_or_create_quiz_by_name(row.quiz_title)
                 log.info("Quiz '%s' был создан автоматически: quiz_id=%s", row.quiz_title, quiz_id)
-
+            # гарантируем комбинированную систему
+            self.repo.ensure_quiz_system_combined(quiz_id, force_show_score=True)
+            
             post_id = self.repo.ensure_quiz_post(
                 quiz_id=quiz_id,
                 quiz_name=row.quiz_title,

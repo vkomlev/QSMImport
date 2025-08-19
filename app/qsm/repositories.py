@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 from app.utils.text import slugify
+import re
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ class QsmRepository:
             "timer_limit": 0,
             "quiz_stye": "",                # в схеме именно 'quiz_stye'
             "question_numbering": 0,
-            "quiz_settings": "",
+            "quiz_settings": self._minimal_quiz_settings(system=1),
             "theme_selected": "",
             # last_activity — зададим через NOW()
             "require_log_in": 0,
@@ -555,4 +556,115 @@ class QsmRepository:
             quiz_id=quiz_id, title=quiz_name, author_id=author_id,
             site_base_url=site_url, status=status, force_update_guid=False
         )
+    
+    # === helpers for quiz_settings ===
+
+    _SYSTEM_PAIR_RE = re.compile(r'(s:6:"system";s:1:")([01])(")')
+
+    @staticmethod
+    def _minimal_quiz_settings(system: int = 1) -> str:
+        """
+        Минимально достаточный сериализованный блок quiz_settings с quiz_options->system.
+        Синтаксис — PHP serialize; структура совместима с тем, что QSM сам пишет.
+        """
+        # Вариант, аналогичный тому, что вы видели у квизов 28+, но с system="1"
+        # a:3:{s:12:"quiz_options";s:...:"a:23:{ ... s:6:"system";s:1:"1"; ... }"; s:9:"quiz_text";s:...; s:17:"quiz_leaderboards";s:...;}
+        # Чтобы не городить полный конструктор сериализации, берём проверенную заготовку.
+        return (
+            'a:3:{'
+              's:12:"quiz_options";s:714:'
+                '"a:23:{'
+                   's:6:"system";s:1:"%s";'
+                   's:21:"loggedin_user_contact";s:1:"0";'
+                   's:21:"contact_info_location";s:1:"0";'
+                   's:9:"user_name";s:1:"1";'
+                   's:9:"user_comp";s:1:"0";'
+                   's:10:"user_email";s:1:"0";'
+                   's:10:"user_phone";s:1:"0";'
+                   's:15:"comment_section";s:1:"0";'
+                   's:16:"randomness_order";s:1:"0";'
+                   's:19:"question_from_total";s:1:"0";'
+                   's:21:"question_per_category";N;'
+                   's:16:"total_user_tries";s:1:"0";'
+                   's:12:"social_media";s:1:"0";'
+                   's:10:"pagination";s:1:"0";'
+                   's:11:"timer_limit";s:1:"0";'
+                   's:18:"question_numbering";s:1:"0";'
+                   's:14:"require_log_in";s:1:"0";'
+                   's:19:"limit_total_entries";s:1:"0";'
+                   's:20:"scheduled_time_start";s:0:"";'
+                   's:18:"scheduled_time_end";s:0:"";'
+                   's:23:"disable_answer_onselect";s:1:"0";'
+                   's:17:"ajax_show_correct";s:1:"0";'
+                   's:21:"preferred_date_format";N;'
+                '}";'
+              's:9:"quiz_text";s:810:'
+                '"a:20:{'
+                   's:14:"message_before";s:0:"";'
+                   's:15:"message_comment";s:0:"";'
+                   's:20:"message_end_template";s:0:"";'
+                   's:18:"comment_field_text";s:22:"Комментарий";'
+                   's:24:"question_answer_template";s:0:"";'
+                   's:18:"submit_button_text";s:18:"Отправить";'
+                   's:15:"name_field_text";s:24:"Фамилия и имя";'
+                   's:19:"business_field_text";s:0:"";'
+                   's:16:"email_field_text";s:5:"Email";'
+                   's:16:"phone_field_text";s:14:"Телефон";'
+                   's:21:"total_user_tries_text";s:0:"";'
+                   's:20:"twitter_sharing_text";s:0:"";'
+                   's:21:"facebook_sharing_text";s:0:"";'
+                   's:21:"linkedin_sharing_text";s:0:"";'
+                   's:20:"previous_button_text";s:10:"Назад";'
+                   's:16:"next_button_text";s:10:"Далее";'
+                   's:19:"require_log_in_text";s:0:"";'
+                   's:24:"limit_total_entries_text";s:0:"";'
+                   's:24:"scheduled_timeframe_text";s:0:"";'
+                   's:22:"start_quiz_survey_text";s:10:"Start Quiz";'
+                '}";'
+              's:17:"quiz_leaderboards";s:28:"a:1:{s:8:"template";s:0:"";}";'
+            '}'
+        ) % (str(int(system)))
+
+    def ensure_quiz_system_combined(self, quiz_id: int, force_show_score: bool = True) -> None:
+        """
+        Делает grading-систему комбинированной: 'system' = 1 в quiz_settings.
+        При необходимости включает show_score=1.
+        Работает бережно: если строки нет — создаёт минимальный блок; если есть — только правит system.
+        """
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT quiz_settings, show_score FROM wp_mlw_quizzes WHERE quiz_id=:qid"),
+                {"qid": quiz_id}
+            ).fetchone()
+            if not row:
+                log.warning("Quiz %s not found when ensuring 'system=1'", quiz_id)
+                return
+
+            qset: Optional[str] = row.quiz_settings
+            show_score: int = int(row.show_score or 0)
+
+            if not qset:
+                new_qset = self._minimal_quiz_settings(system=1)
+            else:
+                # есть строка — попробуем заменить system
+                if 's:6:"system";' in qset:
+                    new_qset = self._SYSTEM_PAIR_RE.sub(r'\g<1>1\3', qset)
+                else:
+                    # ключа нет — оставим как есть (не лезем в произвольную структуру) и логируем
+                    log.info("quiz_settings has no 'system' key for quiz_id=%s; leaving as-is", quiz_id)
+                    new_qset = qset
+
+            # Обновить только если реально меняем
+            if new_qset != qset or (force_show_score and show_score != 1):
+                conn.execute(
+                    text("""
+                        UPDATE wp_mlw_quizzes
+                           SET quiz_settings=:qs,
+                               show_score=:ss
+                         WHERE quiz_id=:qid
+                    """),
+                    {"qs": new_qset, "ss": 1 if force_show_score else show_score, "qid": quiz_id}
+                )
+                log.info("Quiz %s: set system=1 in quiz_settings; show_score=%s",
+                         quiz_id, 1 if force_show_score else show_score)
 
