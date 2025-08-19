@@ -37,9 +37,15 @@ class Settings(BaseSettings):
     log_max_bytes: int = 5 * 1024 * 1024  # 5 MB
     log_backup_count: int = 3
 
+    # posts meta
+    site_url: str = "https://victor-komlev.ru/"
+    wp_author_id: str = "3"
+
     # pydantic v2 style config:
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",  # лишние переменные окружения игнорируем
     )
+
+    

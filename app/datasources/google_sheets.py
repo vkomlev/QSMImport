@@ -31,7 +31,7 @@ class GoogleSheetsSource:
                     correct_answer=(r.get("Правильный ответ") or "").strip(),
                     input_link=(r.get("Входные данные") or "").strip(),
                     qtype_code=(r.get("Тип задания") or "").strip(),
-                    quiz_title=(r.get("Тема - название теста") or "").strip(),
+                    quiz_title=(r.get("Тема") or "").strip(),
                     difficulty_ru=(r.get("Сложность") or "").strip(),
                     hint=(r.get("Текст подсказки") or "").strip(),
                     video_url=(r.get("Видеоразбор") or "").strip(),

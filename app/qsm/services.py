@@ -1,3 +1,4 @@
+#app/qsm/services.py
 from __future__ import annotations
 from typing import List, Dict
 import logging
@@ -7,6 +8,7 @@ from app.utils import parsing, text
 from app.mappers.difficulty_mapper import map_ru_to_term_name
 from . import builders
 from .repositories import QsmRepository
+from app.config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -16,11 +18,15 @@ class ImportService:
     """
 
     def __init__(self, repo: QsmRepository, default_points_short_answer: float = 10.0,
-                 prepend_input_link: bool = True, input_link_label: str = "Входные данные"):
+                 prepend_input_link: bool = True, input_link_label: str = "Входные данные",
+                 wp_site_url: str | None = None, wp_author_id: int = 1, wp_post_status: str = "private"):
         self.repo = repo
         self.default_points_short_answer = default_points_short_answer
         self.prepend_input_link = prepend_input_link
         self.input_link_label = input_link_label
+        self.wp_site_url = wp_site_url
+        self.wp_author_id = wp_author_id
+        self.wp_post_status = wp_post_status
 
     def _make_settings(self, qtype: QuestionType, title: str, placeholder: str) -> str:
         return builders.settings_for_type(qtype, title, placeholder)
@@ -78,9 +84,17 @@ class ImportService:
         for row in rows:
             quiz_id = self.repo.get_quiz_id_by_name(row.quiz_title)
             if not quiz_id:
-                log.error("Квиз '%s' не найден в БД.", row.quiz_title)
-                continue
+                quiz_id = self.repo.get_or_create_quiz_by_name(row.quiz_title)
+                log.info("Quiz '%s' был создан автоматически: quiz_id=%s", row.quiz_title, quiz_id)
 
+            self.repo.ensure_quiz_post(
+                quiz_id=quiz_id,
+                quiz_name=row.quiz_title,
+                author_id=self.wp_author_id,
+                site_url=self.wp_site_url,
+                status=self.wp_post_status,
+            )
+            
             qtype = self._qtype_from_code(row.qtype_code)
 
             # Текст вопроса (+ входные данные)
@@ -100,12 +114,16 @@ class ImportService:
             qid = self.repo.insert_question(
                 quiz_id=quiz_id,
                 qtype_new="0" if qtype in (QuestionType.SC, QuestionType.MC) else
-                          "3" if qtype in (QuestionType.SA, QuestionType.SA_COM) else
-                          "5",
+                        "3" if qtype in (QuestionType.SA, QuestionType.SA_COM) else
+                        "5",
                 question_settings=q_settings,
                 answer_array=a_array,
                 comments=comments,
                 question_answer_info=qinfo,
+                hints="",                 # можно оставить как раньше
+                category="",              # термы мы вешаем отдельно
+                question_name=title,      # <-- НОВОЕ: для NOT NULL question_name
+                question_order=0,         # опционально можно параметризовать
             )
 
             # Term: Difficulty + конкретный уровень
