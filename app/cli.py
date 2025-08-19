@@ -1,3 +1,4 @@
+# app/cli.py
 import typer
 from app.config import Settings
 from app.logging_config import setup_logging
@@ -29,6 +30,9 @@ def import_from_gsheets():
         default_points_short_answer=settings.default_points_short_answer,
         prepend_input_link=settings.prepend_input_link,
         input_link_label=settings.input_link_label,
+        wp_site_url=settings.site_url,
+        wp_author_id=settings.wp_author_id,
+        wp_post_status='publish',
     )
     service.import_questions_batch(rows)
     print("Импорт завершён.")

@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # posts meta
     site_url: str = "https://victor-komlev.ru/"
-    wp_author_id: str = "3"
+    wp_author_id: int = 3
 
     # pydantic v2 style config:
     model_config = SettingsConfigDict(

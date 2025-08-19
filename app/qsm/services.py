@@ -87,13 +87,15 @@ class ImportService:
                 quiz_id = self.repo.get_or_create_quiz_by_name(row.quiz_title)
                 log.info("Quiz '%s' был создан автоматически: quiz_id=%s", row.quiz_title, quiz_id)
 
-            self.repo.ensure_quiz_post(
+            post_id = self.repo.ensure_quiz_post(
                 quiz_id=quiz_id,
                 quiz_name=row.quiz_title,
                 author_id=self.wp_author_id,
                 site_url=self.wp_site_url,
                 status=self.wp_post_status,
             )
+            # (не обязательно) ещё раз гарантируем мету:
+            self.repo.upsert_postmeta(post_id, "quiz_id", str(quiz_id))
             
             qtype = self._qtype_from_code(row.qtype_code)
 

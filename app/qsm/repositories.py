@@ -1,11 +1,12 @@
 # app/qsm/repositories.py
 from __future__ import annotations
-from typing import Iterable, Dict, Any, List
+from typing import Iterable, Dict, Any, List, Optional
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin
+from app.utils.text import slugify
 
 log = logging.getLogger(__name__)
 
@@ -329,22 +330,66 @@ class QsmRepository:
     
     # ---- posts (qsm_quiz) ----
 
-    def get_quiz_post_id(self, quiz_id: int) -> int | None:
+    def _find_quiz_post_by_meta(self, quiz_id: int) -> Optional[int]:
         """
-        Ищет пост типа qsm_quiz по точному шорткоду [mlw_quizmaster quiz=ID].
-        Возвращает ID поста или None.
+        Возвращает ID поста типа qsm_quiz по метаданным (wp_postmeta.meta_key='quiz_id').
+        Если не найдено — None.
         """
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT p.ID
+                  FROM wp_posts p
+                  JOIN wp_postmeta m ON m.post_id = p.ID
+                 WHERE p.post_type = 'qsm_quiz'
+                   AND p.post_status <> 'trash'
+                   AND m.meta_key = 'quiz_id'
+                   AND m.meta_value = :qid
+                 LIMIT 1
+            """), {"qid": str(quiz_id)}).fetchone()
+            return int(row.ID) if row else None
+
+    def get_quiz_post_id(self, quiz_id: int) -> Optional[int]:
+        """
+        Ищет пост qsm_quiz для данного quiz_id:
+        1) по метаданным (wp_postmeta.quiz_id)
+        2) по точному содержимому шорткода в post_content
+        """
+        pid = self._find_quiz_post_by_meta(quiz_id)
+        if pid:
+            return pid
+
         shortcode = f"[mlw_quizmaster quiz={quiz_id}]"
         with self.engine.connect() as conn:
             row = conn.execute(text("""
                 SELECT ID FROM wp_posts
                 WHERE post_type='qsm_quiz'
                   AND post_status<>'trash'
-                  AND post_content LIKE :sc
-                ORDER BY ID DESC
+                  AND post_content = :sc
                 LIMIT 1
-            """), {"sc": f"%{shortcode}%"}).fetchone()
+            """), {"sc": shortcode}).fetchone()
             return int(row.ID) if row else None
+
+    def upsert_postmeta(self, post_id: int, meta_key: str, meta_value: str) -> None:
+        """
+        Вставляет/обновляет wp_postmeta. Если ключ уже есть — обновляет значение.
+        """
+        with self.engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT meta_id FROM wp_postmeta
+                 WHERE post_id=:pid AND meta_key=:k
+                 LIMIT 1
+            """), {"pid": post_id, "k": meta_key}).fetchone()
+            if row:
+                conn.execute(text("""
+                    UPDATE wp_postmeta
+                       SET meta_value=:v
+                     WHERE meta_id=:mid
+                """), {"v": meta_value, "mid": int(row.meta_id)})
+            else:
+                conn.execute(text("""
+                    INSERT INTO wp_postmeta (post_id, meta_key, meta_value)
+                    VALUES (:pid, :k, :v)
+                """), {"pid": post_id, "k": meta_key, "v": meta_value})
 
     def _slug_exists(self, slug: str) -> bool:
         with self.engine.connect() as conn:
@@ -364,89 +409,150 @@ class QsmRepository:
             counter += 1
         return slug
 
-    def create_quiz_post(self,
-                         quiz_id: int,
-                         quiz_name: str,
-                         author_id: int = 1,
-                         site_url: str | None = None,
-                         status: str = "private") -> int:
+    def create_or_update_quiz_post(
+        self,
+        quiz_id: int,
+        title: str,
+        author_id: int,
+        status: str = "publish",
+        site_base_url: str | None = None,
+        force_update_guid: bool = False,
+    ) -> int:
         """
-        Создаёт пост типа qsm_quiz с шорткодом на данный quiz_id.
-        Возвращает ID нового поста.
+        Создаёт/обновляет пост типа qsm_quiz с шорткодом и гарантирует wp_postmeta('quiz_id').
+        Возвращает post_id.
         """
-        from app.utils.text import slugify  # ваш помощник-транслитератор
-
-        now_local = datetime.now()
-        now_gmt = datetime.now(timezone.utc).replace(tzinfo=None)
-
-        content = f"[mlw_quizmaster quiz={quiz_id}]"
-        slug = self._make_unique_slug(slugify(quiz_name))
-
-        # Базовые поля, достаточные для появления поста в админке
-        cols = [
-            "post_author", "post_date", "post_date_gmt", "post_content", "post_title",
-            "post_excerpt", "post_status", "comment_status", "ping_status", "post_password",
-            "post_name", "to_ping", "pinged", "post_modified", "post_modified_gmt",
-            "post_content_filtered", "post_parent", "menu_order", "post_type",
-            "post_mime_type", "comment_count", "guid"
-        ]
-        vals = {
-            "post_author": author_id,
-            "post_date": now_local.strftime("%Y-%m-%d %H:%M:%S"),
-            "post_date_gmt": now_gmt.strftime("%Y-%m-%d %H:%M:%S"),
-            "post_content": content,
-            "post_title": quiz_name,
-            "post_excerpt": "",
-            "post_status": status,          # 'private' или 'draft'
-            "comment_status": "closed",
-            "ping_status": "closed",
-            "post_password": "",
-            "post_name": slug,
-            "to_ping": "",
-            "pinged": "",
-            "post_modified": now_local.strftime("%Y-%m-%d %H:%M:%S"),
-            "post_modified_gmt": now_gmt.strftime("%Y-%m-%d %H:%M:%S"),
-            "post_content_filtered": "",
-            "post_parent": 0,
-            "menu_order": 0,
-            "post_type": "qsm_quiz",
-            "post_mime_type": "",
-            "comment_count": 0,
-            # временно пустой guid — обновим ниже, когда узнаем ID
-            "guid": "",
-        }
-
-        placeholders = ", ".join(f":{c}" for c in cols)
-        sql = f"""
-            INSERT INTO wp_posts ({", ".join(cols)})
-            VALUES ({placeholders})
-        """
+        shortcode = f"[mlw_quizmaster quiz={quiz_id}]"
+        safe_slug = self._make_unique_slug(slugify(title))
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
         with self.engine.begin() as conn:
-            conn.execute(text(sql), vals)
-            row = conn.execute(text("SELECT LAST_INSERT_ID() AS id")).fetchone()
-            post_id = int(row.id)
+            # 1) пробуем найти по метаданным
+            row = conn.execute(text("""
+                SELECT p.ID
+                  FROM wp_posts p
+                  JOIN wp_postmeta m ON m.post_id = p.ID
+                 WHERE p.post_type='qsm_quiz'
+                   AND p.post_status<>'trash'
+                   AND m.meta_key='quiz_id'
+                   AND m.meta_value=:qid
+                 LIMIT 1
+            """), {"qid": str(quiz_id)}).fetchone()
 
-            # Проставим GUID (опционально)
-            if site_url:
-                guid = urljoin(site_url.rstrip("/") + "/", f"?post_type=qsm_quiz&p={post_id}")
-                conn.execute(text("UPDATE wp_posts SET guid=:g WHERE ID=:id"),
-                             {"g": guid, "id": post_id})
+            if row:
+                post_id = int(row.ID)
+                conn.execute(text("""
+                    UPDATE wp_posts
+                       SET post_title=:title,
+                           post_name=:slug,
+                           post_status=:status,
+                           post_author=:author,
+                           post_modified=:now_local,
+                           post_modified_gmt=:now_gmt,
+                           post_content=:sc
+                     WHERE ID=:pid
+                """), {
+                    "title": title, "slug": safe_slug, "status": status, "author": author_id,
+                    "now_local": now, "now_gmt": now, "sc": shortcode, "pid": post_id
+                })
+                # meta quiz_id гарантированно будет (на всякий случай — апдейт)
+                conn.execute(text("""
+                    UPDATE wp_postmeta SET meta_value=:qid
+                     WHERE post_id=:pid AND meta_key='quiz_id'
+                """), {"qid": str(quiz_id), "pid": post_id})
+                if site_base_url and force_update_guid:
+                    guid = f"{site_base_url.rstrip('/')}/?post_type=qsm_quiz&p={post_id}"
+                    conn.execute(text("UPDATE wp_posts SET guid=:g WHERE ID=:pid"),
+                                 {"g": guid, "pid": post_id})
+                return post_id
 
-            log.info("Created wp_posts qsm_quiz post_id=%s for quiz_id=%s", post_id, quiz_id)
+            # 2) пробуем найти по шорткоду
+            row = conn.execute(text("""
+                SELECT ID FROM wp_posts
+                 WHERE post_type='qsm_quiz'
+                   AND post_content=:sc
+                 LIMIT 1
+            """), {"sc": shortcode}).fetchone()
+
+            if row:
+                post_id = int(row.ID)
+                conn.execute(text("""
+                    UPDATE wp_posts
+                       SET post_title=:title,
+                           post_name=:slug,
+                           post_status=:status,
+                           post_author=:author,
+                           post_modified=:now_local,
+                           post_modified_gmt=:now_gmt
+                     WHERE ID=:pid
+                """), {
+                    "title": title, "slug": safe_slug, "status": status, "author": author_id,
+                    "now_local": now, "now_gmt": now, "pid": post_id
+                })
+            else:
+                # 3) создаём новый
+                vals = {
+                    "post_author": author_id,
+                    "post_date": now, "post_date_gmt": now,
+                    "post_content": shortcode,
+                    "post_title": title,
+                    "post_excerpt": "",
+                    "post_status": status,
+                    "comment_status": "closed",
+                    "ping_status": "closed",
+                    "post_password": "",
+                    "post_name": safe_slug,
+                    "to_ping": "", "pinged": "",
+                    "post_modified": now, "post_modified_gmt": now,
+                    "post_content_filtered": "",
+                    "post_parent": 0,
+                    "menu_order": 0,
+                    "post_type": "qsm_quiz",
+                    "post_mime_type": "",
+                    "comment_count": 0,
+                }
+                placeholders = ", ".join([f":{k}" for k in vals.keys()])
+                conn.execute(text(f"""
+                    INSERT INTO wp_posts ({", ".join(vals.keys())})
+                    VALUES ({placeholders})
+                """), vals)
+                r = conn.execute(text("SELECT LAST_INSERT_ID() AS id")).fetchone()
+                post_id = int(r.id)
+                if site_base_url and force_update_guid:
+                    guid = f"{site_base_url.rstrip('/')}/?post_type=qsm_quiz&p={post_id}"
+                    conn.execute(text("UPDATE wp_posts SET guid=:g WHERE ID=:pid"),
+                                 {"g": guid, "pid": post_id})
+
+            # ГАРАНТИЯ: postmeta('quiz_id' = quiz_id)
+            conn.execute(text("""
+                INSERT INTO wp_postmeta (post_id, meta_key, meta_value)
+                SELECT :pid, 'quiz_id', :qid FROM DUAL
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM wp_postmeta
+                     WHERE post_id=:pid AND meta_key='quiz_id'
+                 )
+            """), {"pid": post_id, "qid": str(quiz_id)})
+            conn.execute(text("""
+                UPDATE wp_postmeta SET meta_value=:qid
+                 WHERE post_id=:pid AND meta_key='quiz_id'
+            """), {"pid": post_id, "qid": str(quiz_id)})
+
             return post_id
 
-    def ensure_quiz_post(self,
-                         quiz_id: int,
-                         quiz_name: str,
-                         author_id: int = 1,
-                         site_url: str | None = None,
-                         status: str = "private") -> int:
+    def set_quiz_author(self, quiz_id: int, user_id: int) -> None:
+        """Обновляет wp_mlw_quizzes.quiz_author_id."""
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE wp_mlw_quizzes SET quiz_author_id=:uid WHERE quiz_id=:qid
+            """), {"uid": user_id, "qid": quiz_id})
+
+    def ensure_quiz_post(self, quiz_id: int, quiz_name: str, author_id: int = 1,
+                         site_url: str | None = None, status: str = "publish") -> int:
         """
-        Возвращает ID поста qsm_quiz. Создаёт, если не найден.
+        Возвращает ID поста qsm_quiz и гарантирует meta('quiz_id').
         """
-        pid = self.get_quiz_post_id(quiz_id)
-        if pid:
-            return pid
-        return self.create_quiz_post(quiz_id, quiz_name, author_id=author_id, site_url=site_url, status=status)
+        return self.create_or_update_quiz_post(
+            quiz_id=quiz_id, title=quiz_name, author_id=author_id,
+            site_base_url=site_url, status=status, force_update_guid=False
+        )
 

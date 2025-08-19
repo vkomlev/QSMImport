@@ -15,7 +15,7 @@ def normalize(s: str) -> str:
 def add_input_link_to_title(title: str, link: str, label: str) -> str:
     if not link:
         return title
-    return f"[{label}: {link}]\n\n{title}".strip()
+    return f"{title}\nСсылки на уроки: {link}".strip()
 
 def slugify(value: str, allow_unicode: bool = False) -> str:
     """
