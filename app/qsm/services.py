@@ -115,19 +115,19 @@ class ImportService:
             qinfo = row.video_url or ""
 
             # Вставка вопроса
-            qid = self.repo.insert_question(
+            qid = self.repo.upsert_question(
                 quiz_id=quiz_id,
-                qtype_new="0" if qtype in (QuestionType.SC, QuestionType.MC) else
-                        "3" if qtype in (QuestionType.SA, QuestionType.SA_COM) else
-                        "5",
+                qtype_new=("0" if qtype in (QuestionType.SC, QuestionType.MC)
+                           else "3" if qtype in (QuestionType.SA, QuestionType.SA_COM)
+                           else "5"),
                 question_settings=q_settings,
                 answer_array=a_array,
                 comments=comments,
                 question_answer_info=qinfo,
-                hints="",                 # можно оставить как раньше
-                category="",              # термы мы вешаем отдельно
-                question_name=title,      # <-- НОВОЕ: для NOT NULL question_name
-                question_order=0,         # опционально можно параметризовать
+                hints="",
+                category="",
+                question_name=title,
+                question_order=0,
             )
 
             # Term: Difficulty + конкретный уровень

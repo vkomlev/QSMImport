@@ -310,6 +310,92 @@ class QsmRepository:
             log.info("Inserted question quiz_id=%s question_id=%s", quiz_id, qid)
             return qid
 
+    def update_question(self,
+                        question_id: int,
+                        qtype_new: str,
+                        question_settings: str,
+                        answer_array: str,
+                        comments: int,
+                        question_answer_info: str = "",
+                        hints: str = "",
+                        category: str = "") -> None:
+        """
+        Обновляет ключевые поля существующего вопроса.
+        Внимание: question_order НЕ трогаем, чтобы не нарушить ручную сортировку.
+        """
+        # старое числовое поле (на всякий)
+        try:
+            qtype_num = int(qtype_new)
+        except ValueError:
+            qtype_num = 0
+
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE wp_mlw_questions
+                   SET answer_array=:aa,
+                       question_answer_info=:qinfo,
+                       comments=:cm,
+                       hints=:hints,
+                       question_type=:qtype_num,
+                       question_type_new=:qtype_new,
+                       question_settings=:qs,
+                       category=:cat
+                 WHERE question_id=:qid
+            """), {
+                "aa": answer_array,
+                "qinfo": question_answer_info or "",
+                "cm": comments,
+                "hints": hints or "",
+                "qtype_num": qtype_num,
+                "qtype_new": qtype_new,
+                "qs": question_settings,
+                "cat": category or "",
+                "qid": question_id,
+            })
+
+    def upsert_question(self,
+                        quiz_id: int,
+                        qtype_new: str,
+                        question_settings: str,
+                        answer_array: str,
+                        comments: int,
+                        question_name: str,
+                        question_answer_info: str = "",
+                        hints: str = "",
+                        category: str = "",
+                        question_order: int = 0) -> int:
+        """
+        Ищет вопрос по (quiz_id, question_name). Если найден — обновляет и возвращает его ID.
+        Иначе — создаёт новый и возвращает его ID.
+        """
+        existing_id = self.get_question_id_by_title(quiz_id, question_name)
+        if existing_id:
+            self.update_question(
+                question_id=existing_id,
+                qtype_new=qtype_new,
+                question_settings=question_settings,
+                answer_array=answer_array,
+                comments=comments,
+                question_answer_info=question_answer_info,
+                hints=hints,
+                category=category,
+            )
+            log.info("Updated question quiz_id=%s question_id=%s (title match)", quiz_id, existing_id)
+            return existing_id
+
+        # если не нашли — создаём
+        return self.insert_question(
+            quiz_id=quiz_id,
+            qtype_new=qtype_new,
+            question_settings=question_settings,
+            answer_array=answer_array,
+            comments=comments,
+            question_answer_info=question_answer_info,
+            hints=hints,
+            category=category,
+            question_name=question_name,
+            question_order=question_order,
+        )
 
     def update_quiz_pages(self, quiz_id: int, question_ids: List[int]) -> None:
         """
@@ -667,4 +753,17 @@ class QsmRepository:
                 )
                 log.info("Quiz %s: set system=1 in quiz_settings; show_score=%s",
                          quiz_id, 1 if force_show_score else show_score)
+    
+    def get_question_id_by_title(self, quiz_id: int, question_name: str) -> Optional[int]:
+        """
+        Возвращает question_id вопроса с точным совпадением question_name в рамках квиза.
+        """
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT question_id
+                  FROM wp_mlw_questions
+                 WHERE quiz_id=:qid AND question_name=:qn AND deleted=0
+                 LIMIT 1
+            """), {"qid": quiz_id, "qn": question_name}).fetchone()
+            return int(row.question_id) if row else None
 
