@@ -766,4 +766,3 @@ class QsmRepository:
                  LIMIT 1
             """), {"qid": quiz_id, "qn": question_name}).fetchone()
             return int(row.question_id) if row else None
-
