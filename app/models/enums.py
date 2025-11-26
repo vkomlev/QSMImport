@@ -6,12 +6,13 @@ class QuestionType(str, Enum):
     MC = "MC"        # multi choice
     SA = "SA"        # short answer (однострочный ввод)
     TA = "TA"        # textarea (многострочный ввод)
-    SA_COM = "SA+COM"  # короткий ввод + обяз. комментарий
+    SA_COM = "SA_COM"  # короткий ввод + обяз. комментарий
 
 
 class Difficulty(str, Enum):
     THEORY = "Теория"
-    EASY = "Базовая"
-    NORMAL = "Нормальная"
+    EASY = "Простой"
+    NORMAL = "Средняя"
     HARD = "Сложная"
     PROJECT = "Проектная"
+    OLIMPIC = "Олимпиадная"

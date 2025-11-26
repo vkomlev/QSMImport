@@ -1,12 +1,20 @@
 # app/cli.py
+import json
+
 import typer
+
 from app.config import Settings
 from app.logging_config import setup_logging
 from app.qsm.repositories import QsmRepository
 from app.qsm.services import ImportService
 from app.datasources.google_sheets import GoogleSheetsSource
 
+# НОВОЕ:
+from app.datasources.lms_api import LmsApiClient
+from app.mappers.lms_task_mapper import row_to_task_upsert_item
+
 app = typer.Typer(add_completion=False)
+
 
 @app.command()
 def import_from_gsheets():
@@ -37,8 +45,108 @@ def import_from_gsheets():
     service.import_questions_batch(rows)
     print("Импорт завершён.")
 
+
+# НОВАЯ КОМАНДА
+@app.command()
+def dry_run_lms_import(
+    limit: int = typer.Option(3, help="Сколько первых строк из Google Sheets проверять"),
+):
+    """
+    Dry-run импорт в LMS:
+    - читает первые N строк из Google Sheets
+    - получает meta/tasks из LMS
+    - маппит строки в TaskUpsertItem
+    - валидирует каждую задачу через /api/v1/tasks/validate
+    - печатает итоговые JSON-структуры и результат валидации
+
+    Ничего в LMS не записывается.
+    """
+    settings = Settings()
+    setup_logging(settings)
+
+    # Проверка настроек LMS
+    if not settings.lms_api_base_url:
+        typer.echo("❌ lms_api_base_url не задан в настройках (.env).")
+        raise typer.Exit(code=1)
+    if not settings.lms_api_key:
+        typer.echo("❌ lms_api_key не задан в настройках (.env).")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Используем LMS API: {settings.lms_api_base_url}")
+
+    # Источник данных Google Sheets
+    src = GoogleSheetsSource(
+        spreadsheet_id=settings.gsheets_spreadsheet_id or "",
+        worksheet_name=settings.gsheets_worksheet_name,
+        service_account_json=settings.gsheets_service_account_json or "",
+    )
+    rows = src.fetch_rows()
+
+    if not rows:
+        typer.echo("❌ В листе Google Sheets нет строк.")
+        raise typer.Exit(code=1)
+
+    rows_sample = rows[:limit]
+
+    # Клиент LMS API
+    lms_client = LmsApiClient(settings)
+
+    typer.echo("Запрашиваю метаданные задач (difficulties, courses, ...) из LMS...")
+    meta = lms_client.get_tasks_meta()
+
+    typer.echo(f"Получены метаданные: difficulties={len(meta.get('difficulties', []))}, "
+               f"courses={len(meta.get('courses', []))}")
+
+    typer.echo(f"\nПроверяем первые {len(rows_sample)} строк(и) из Google Sheets:\n")
+
+    for idx, row in enumerate(rows_sample, start=1):
+        typer.echo("-" * 80)
+        typer.echo(f"Строка #{idx}")
+        typer.echo(f"  Код вопроса: {row.question_code!r}")
+        typer.echo(f"  Код курса:   {row.course_code!r}")
+        typer.echo(f"  Тип:         {row.qtype_code!r}")
+        typer.echo(f"  Сложность:   {row.difficulty_ru!r}")
+        typer.echo(f"  Тема:        {row.quiz_title!r}")
+
+        try:
+            upsert_item = row_to_task_upsert_item(row, meta, settings)
+        except Exception as e:
+            typer.echo(f"❌ Ошибка маппинга row_to_task_upsert_item: {e}")
+            continue
+
+        typer.echo("Сформированный TaskUpsertItem:")
+        typer.echo(
+            json.dumps(upsert_item, ensure_ascii=False, indent=2)
+        )
+
+        # Формируем payload для валидации.
+        # В простейшем варианте считаем, что validate_task принимает ту же структуру,
+        # что и один элемент TaskUpsertItem, либо её подмножество.
+        validate_payload = {
+            "task_content": upsert_item["task_content"],
+            "solution_rules": upsert_item["solution_rules"],
+            "max_score": upsert_item["max_score"],
+            "difficulty_id": upsert_item["difficulty_id"],
+            "course_id": upsert_item["course_id"],
+            "external_uid": upsert_item["external_uid"],
+        }
+
+        typer.echo("\nРезультат валидации через /api/v1/tasks/validate:")
+
+        try:
+            validation_result = lms_client.validate_task(validate_payload)
+            typer.echo(
+                json.dumps(validation_result, ensure_ascii=False, indent=2)
+            )
+        except Exception as e:
+            typer.echo(f"❌ Ошибка при валидации задачи в LMS: {e}")
+
+    typer.echo("\n✅ Dry-run завершён.")
+
+
 def main():
     app()
+
 
 if __name__ == "__main__":
     main()

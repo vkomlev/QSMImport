@@ -25,6 +25,27 @@ class Settings(BaseSettings):
         description="Путь к credentials JSON (если используем gspread)",
     )
 
+        # --------- LMS API ----------
+    lms_api_base_url: AnyUrl | None = Field(
+        default=None,
+        description="Базовый URL LMS Core API, например: http://localhost:8000 или https://lms.example.com",
+    )
+
+    lms_api_key: str | None = Field(
+        default=None,
+        description="API ключ, передаваемый в query-параметре ?api_key=...",
+    )
+
+    lms_api_timeout: float = Field(
+        default=10.0,
+        description="Таймаут HTTP-запросов к LMS API, сек.",
+    )
+
+    lms_import_dry_run: bool = Field(
+        default=False,
+        description="Режим 'только валидация', без записи задач в LMS.",
+    )
+    
     # --------- Import behavior ----------
     default_points_short_answer: float = 10.0
     prepend_input_link: bool = True
