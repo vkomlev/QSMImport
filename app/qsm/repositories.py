@@ -21,6 +21,151 @@ class QsmRepository:
 
     def __init__(self, db_url: str):
         self.engine = create_engine(db_url, pool_pre_ping=True)
+
+    # 1) system="3" вместо "1"
+    _SYSTEM_PAIR_RE = re.compile(r'(s:6:"system";s:1:")(\d)(")')
+
+    def ensure_quiz_system_combined(self, quiz_id: int, force_show_score: bool = True) -> None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT quiz_settings, show_score FROM wp_mlw_quizzes WHERE quiz_id=:qid"),
+                {"qid": quiz_id}
+            ).fetchone()
+            if not row:
+                log.warning("Quiz %s not found when ensuring system=3", quiz_id)
+                return
+            qset = row.quiz_settings or ""
+            show_score = int(row.show_score or 0)
+
+            # если блока нет — возьмём ваш минимальный, но сразу с system=3
+            if not qset:
+                qset = self._minimal_quiz_settings(system=3)
+
+            new_qset = self._SYSTEM_PAIR_RE.sub(r'\g<1>3\3', qset)
+
+            if new_qset != qset or (force_show_score and show_score != 1):
+                conn.execute(text("""
+                    UPDATE wp_mlw_quizzes
+                    SET quiz_settings=:qs, show_score=:ss
+                    WHERE quiz_id=:qid
+                """), {"qs": new_qset, "ss": 1 if force_show_score else show_score, "qid": quiz_id})
+                log.info("Quiz %s: set system=3; show_score=%s", quiz_id, 1 if force_show_score else show_score)
+
+    # 2) дубли флагов контактной формы (и в колонках, и в quiz_settings)
+    def ensure_quiz_contact_flags(self, quiz_id: int) -> None:
+        with self.engine.begin() as conn:
+            row = conn.execute(text("SELECT quiz_settings FROM wp_mlw_quizzes WHERE quiz_id=:qid"),
+                            {"qid": quiz_id}).fetchone()
+            if not row:
+                return
+            qset = row.quiz_settings or self._minimal_quiz_settings(system=3)
+
+            def replace_kv(s, key, val_str):
+                # подменяем s:«key»;s:1:"X" на нужное значение, если ключ присутствует
+                pattern = re.compile(rf'(s:\d+:"{re.escape(key)}";s:1:")(\d)(")')
+                s2 = pattern.sub(rf'\g<1>{val_str}\3', s)
+                # если не было — не пытаемся «конструировать» заново (по вашим требованиям)
+                return s2
+
+            new_qset = qset
+            new_qset = replace_kv(new_qset, "contact_info_location", "1")
+            new_qset = replace_kv(new_qset, "user_name", "2")
+            new_qset = replace_kv(new_qset, "user_email", "0")
+            new_qset = replace_kv(new_qset, "user_phone", "0")
+
+            if new_qset != qset:
+                conn.execute(text("UPDATE wp_mlw_quizzes SET quiz_settings=:qs WHERE quiz_id=:qid"),
+                            {"qs": new_qset, "qid": quiz_id})
+
+            # синхронизируем явные колонки wp_mlw_quizzes
+            conn.execute(text("""
+                UPDATE wp_mlw_quizzes
+                SET contact_info_location=1,
+                    user_name=2,
+                    user_email=0,
+                    user_phone=0
+                WHERE quiz_id=:qid
+            """), {"qid": quiz_id})
+
+    # 3) message_after — как в «правильном» дампе
+    _MESSAGE_AFTER_SERIALIZED = (
+        'a:1:{i:0;a:5:{s:4:"page";s:70:"Ваши результаты:  %POINT_SCORE% из %MAXIMUM_POINTS%";'
+        's:8:"redirect";b:0;s:12:"default_mark";s:5:"false";s:10:"is_updated";s:1:"1";'
+        's:10:"conditions";a:0:{}}}'
+    )
+
+    def ensure_quiz_message_after(self, quiz_id: int) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE wp_mlw_quizzes
+                SET message_after=:ma
+                WHERE quiz_id=:qid
+            """), {"ma": self._MESSAGE_AFTER_SERIALIZED, "qid": quiz_id})
+
+    # 4) question_from_total внутри quiz_settings
+    _QFT_INT_RE = re.compile(r'(s:19:"question_from_total";)i:\d+')
+
+    def ensure_question_from_total(self, quiz_id: int, total: int) -> None:
+        with self.engine.begin() as conn:
+            row = conn.execute(text("SELECT quiz_settings FROM wp_mlw_quizzes WHERE quiz_id=:qid"),
+                            {"qid": quiz_id}).fetchone()
+            if not row:
+                return
+            qset = row.quiz_settings or ""
+            if not qset:
+                # если пусто — создаём минимальный скелет, но без «додумываний»
+                qset = self._minimal_quiz_settings(system=3)
+
+            new_qset = self._QFT_INT_RE.sub(rf'\g<1>i:{int(total)}', qset)
+            if new_qset != qset:
+                conn.execute(text("""
+                    UPDATE wp_mlw_quizzes SET quiz_settings=:qs WHERE quiz_id=:qid
+                """), {"qs": new_qset, "qid": quiz_id})
+                log.info("Quiz %s: set question_from_total=%s", quiz_id, total)
+
+    # 5) контактная форма (точный фрагмент из «правильного» дампа)
+    _CONTACT_FORM_SERIALIZED = (
+        # фрагмент s:12:"contact_form";s:1429:"a:4:{ ... }" из корректной записи
+        'a:4:{'
+        'i:0;a:13:{s:5:"label";s:21:"Фамилия Имя";s:4:"type";s:4:"text";s:8:"required";s:4:"true";'
+        's:10:"hide_label";s:5:"false";s:18:"use_default_option";s:5:"false";s:3:"use";s:4:"name";'
+        's:6:"enable";s:4:"true";s:11:"placeholder";s:21:"Иванов Иван";s:7:"options";s:0:"";'
+        's:9:"minlength";s:0:"";s:9:"maxlength";s:0:"";s:12:"allowdomains";s:0:"";s:12:"blockdomains";s:0:"";}'
+        'i:1;a:13:{s:5:"label";s:5:"Email";s:4:"type";s:4:"text";s:8:"required";s:5:"false";'
+        's:10:"hide_label";s:5:"false";s:18:"use_default_option";s:5:"false";s:3:"use";s:5:"email";'
+        's:6:"enable";s:5:"false";s:11:"placeholder";s:0:"";s:7:"options";s:0:"";s:9:"minlength";s:0:"";'
+        's:9:"maxlength";s:0:"";s:12:"allowdomains";s:0:"";s:12:"blockdomains";s:0:"";}'
+        'i:2;a:13:{s:5:"label";s:8:"Business";s:4:"type";s:4:"text";s:8:"required";s:5:"false";'
+        's:10:"hide_label";s:5:"false";s:18:"use_default_option";s:5:"false";s:3:"use";s:4:"comp";'
+        's:6:"enable";s:5:"false";s:11:"placeholder";s:0:"";s:7:"options";s:0:"";s:9:"minlength";s:0:"";'
+        's:9:"maxlength";s:0:"";s:12:"allowdomains";s:0:"";s:12:"blockdomains";s:0:"";}'
+        'i:3;a:13:{s:5:"label";s:5:"Phone";s:4:"type";s:4:"text";s:8:"required";s:5:"false";'
+        's:10:"hide_label";s:5:"false";s:18:"use_default_option";s:5:"false";s:3:"use";s:5:"phone";'
+        's:6:"enable";s:5:"false";s:11:"placeholder";s:0:"";s:7:"options";s:0:"";s:9:"minlength";s:0:"";'
+        's:9:"maxlength";s:0:"";s:12:"allowdomains";s:0:"";s:12:"blockdomains";s:0:"";}'
+        '}'
+    )
+
+    def ensure_quiz_contact_form_block(self, quiz_id: int) -> None:
+        with self.engine.begin() as conn:
+            row = conn.execute(text("SELECT quiz_settings FROM wp_mlw_quizzes WHERE quiz_id=:qid"),
+                            {"qid": quiz_id}).fetchone()
+            if not row:
+                return
+            qset = row.quiz_settings or self._minimal_quiz_settings(system=3)
+
+            # если contact_form уже есть — заменим целиком; если нет — аккуратно добавлять не будем
+            if 's:12:"contact_form";' in qset:
+                # подменяем значение contact_form на эталон из дампа
+                qset2 = re.sub(
+                    r's:12:"contact_form";s:\d+:"[^"]*"',
+                    's:12:"contact_form";s:1429:"' + self._CONTACT_FORM_SERIALIZED.replace('"', '\\"') + '"',
+                    qset
+                )
+                if qset2 != qset:
+                    conn.execute(text("UPDATE wp_mlw_quizzes SET quiz_settings=:qs WHERE quiz_id=:qid"),
+                                {"qs": qset2, "qid": quiz_id})
+
     
     def _table_has_columns(self, table: str, columns: list[str]) -> bool:
         """
@@ -643,9 +788,6 @@ class QsmRepository:
             site_base_url=site_url, status=status, force_update_guid=False
         )
     
-    # === helpers for quiz_settings ===
-
-    _SYSTEM_PAIR_RE = re.compile(r'(s:6:"system";s:1:")([01])(")')
 
     @staticmethod
     def _minimal_quiz_settings(system: int = 1) -> str:
@@ -711,48 +853,6 @@ class QsmRepository:
             '}'
         ) % (str(int(system)))
 
-    def ensure_quiz_system_combined(self, quiz_id: int, force_show_score: bool = True) -> None:
-        """
-        Делает grading-систему комбинированной: 'system' = 1 в quiz_settings.
-        При необходимости включает show_score=1.
-        Работает бережно: если строки нет — создаёт минимальный блок; если есть — только правит system.
-        """
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                text("SELECT quiz_settings, show_score FROM wp_mlw_quizzes WHERE quiz_id=:qid"),
-                {"qid": quiz_id}
-            ).fetchone()
-            if not row:
-                log.warning("Quiz %s not found when ensuring 'system=1'", quiz_id)
-                return
-
-            qset: Optional[str] = row.quiz_settings
-            show_score: int = int(row.show_score or 0)
-
-            if not qset:
-                new_qset = self._minimal_quiz_settings(system=1)
-            else:
-                # есть строка — попробуем заменить system
-                if 's:6:"system";' in qset:
-                    new_qset = self._SYSTEM_PAIR_RE.sub(r'\g<1>1\3', qset)
-                else:
-                    # ключа нет — оставим как есть (не лезем в произвольную структуру) и логируем
-                    log.info("quiz_settings has no 'system' key for quiz_id=%s; leaving as-is", quiz_id)
-                    new_qset = qset
-
-            # Обновить только если реально меняем
-            if new_qset != qset or (force_show_score and show_score != 1):
-                conn.execute(
-                    text("""
-                        UPDATE wp_mlw_quizzes
-                           SET quiz_settings=:qs,
-                               show_score=:ss
-                         WHERE quiz_id=:qid
-                    """),
-                    {"qs": new_qset, "ss": 1 if force_show_score else show_score, "qid": quiz_id}
-                )
-                log.info("Quiz %s: set system=1 in quiz_settings; show_score=%s",
-                         quiz_id, 1 if force_show_score else show_score)
     
     def get_question_id_by_title(self, quiz_id: int, question_name: str) -> Optional[int]:
         """

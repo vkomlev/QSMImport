@@ -87,7 +87,16 @@ class ImportService:
                 quiz_id = self.repo.get_or_create_quiz_by_name(row.quiz_title)
                 log.info("Quiz '%s' был создан автоматически: quiz_id=%s", row.quiz_title, quiz_id)
             # гарантируем комбинированную систему
-            self.repo.ensure_quiz_system_combined(quiz_id, force_show_score=True)
+            # гарантируем систему оценивания, контактную форму и «результаты»
+            self.repo.ensure_quiz_system_combined(quiz_id, force_show_score=True)  # system=3 + show_score=1
+            self.repo.ensure_quiz_contact_flags(quiz_id)                           # location=1, name=2, email=0, phone=0
+            self.repo.ensure_quiz_contact_form_block(quiz_id)                      # контактная форма как в дампе
+            self.repo.ensure_quiz_message_after(quiz_id)                           # "Ваши результаты: %POINT_SCORE% из %MAXIMUM_POINTS%"
+
+            # по вашей ремарке — если нужно ограничение вопросов, используем именно question_from_total
+            # (в дампах "maximum_question_limit" нет, есть только question_from_total)
+            # пример: 70
+            self.repo.ensure_question_from_total(quiz_id, total=70)
             
             post_id = self.repo.ensure_quiz_post(
                 quiz_id=quiz_id,
