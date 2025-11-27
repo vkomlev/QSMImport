@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from typing import List
 
 import gspread  # как и было
+import logging
 
 from app.models.question_input import QuestionInputRow
 
+logger = logging.getLogger(__name__)
 
 def _cell_str(row: dict, key: str) -> str:
     """
@@ -42,11 +44,17 @@ class GoogleSheetsSource:
         - "Текст подсказки"
         - "Видеоразбор"
         """
+        logger.info(
+            "Чтение данных из Google Sheets: spreadsheet_id=%s, worksheet_name=%s",
+            self.spreadsheet_id,
+            self.worksheet_name,
+        )
         gc = gspread.service_account(filename=self.service_account_json)
         sh = gc.open_by_key(self.spreadsheet_id)
         ws = sh.worksheet(self.worksheet_name)
 
         records = ws.get_all_records()
+        logger.debug("Получено %d сырых записей из Google Sheets", len(records))
         rows: List[QuestionInputRow] = []
 
         for r in records:
@@ -65,5 +73,8 @@ class GoogleSheetsSource:
                     video_url=_cell_str(r, "Видеоразбор"),
                 )
             )
-
+        logger.info(
+            "Преобразовано в QuestionInputRow: %d строк(и) из Google Sheets",
+            len(rows),
+        )
         return rows

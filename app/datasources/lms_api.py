@@ -50,7 +50,7 @@ class LmsApiClient:
         if self.api_key:
             params["api_key"] = self.api_key
 
-        self.log.debug(f"HTTP {method} {url} params={params} json={json}")
+        self.log.debug("HTTP %s %s params=%s json=%s", method, url, params, json)
 
         resp = requests.request(
             method=method,
@@ -61,7 +61,9 @@ class LmsApiClient:
         )
 
         self.log.debug(
-            f"Response {resp.status_code} {resp.text[:300]}..."
+            "Response %s %s",
+            resp.status_code,
+            resp.text[:300],
         )
 
         resp.raise_for_status()

@@ -23,8 +23,11 @@ def _map_qtype(raw: str) -> QuestionType:
     Бросает ValueError при некорректном коде.
     """
     try:
-        return QuestionType(raw)
+        qtype = QuestionType(raw)
+        log.debug("Маппинг типа задания: raw=%r -> %s", raw, qtype)
+        return qtype
     except ValueError as e:
+        log.error("Неизвестный тип задания qtype_code=%r", raw)
         raise ValueError(f"Unsupported question type code: {raw!r}") from e
 
 
@@ -315,6 +318,9 @@ def map_difficulty_ru_to_lms_id(
     При отсутствии совпадения возвращает id сложности Easy (code='Easy') или 2.
     """
     target = (row.difficulty_ru or "").strip().lower()
+    log.debug(
+        "Маппинг сложности: source=%r (нормализовано=%r)", row.difficulty_ru, target
+    )
 
     for d in meta_difficulties:
         name_ru = (d.get("name_ru") or "").strip().lower()
@@ -350,10 +356,24 @@ def map_quiz_title_to_course_id(
         row.course_code == course['course_uid'].
     """
     code = (row.course_code or "").strip()
+    log.debug("Маппинг курса: course_code=%r", code)
     for c in meta_courses:
-        if (c.get("course_uid") or "").strip() == code:
+        uid = (c.get("course_uid") or "").strip()
+        if uid == code:
+            log.debug(
+                "Курс найден: course_code=%r совпал с course_uid=%r (id=%s, title=%r)",
+                code,
+                uid,
+                c.get("id"),
+                c.get("title"),
+            )
             return int(c["id"])
 
+    log.error(
+        "Не найден курс для course_code=%r в meta_courses (всего курсов=%d)",
+        code,
+        len(meta_courses),
+    )
     raise ValueError(
         f"Не найден курс для course_code={code!r} в meta_courses. "
         "Проверьте 'Код курса' в таблице и настройки LMS."
@@ -370,6 +390,7 @@ def row_to_task_upsert_item(
     для bulk-upsert в LMS.
     """
     if not row.question_code:
+        log.error("Пустой 'Код вопроса' (question_code) в строке Google Sheets")
         raise ValueError("Пустой 'Код вопроса' (question_code) в строке Google Sheets")
 
     qtype = _map_qtype(row.qtype_code)
@@ -379,7 +400,13 @@ def row_to_task_upsert_item(
 
     difficulty_id = map_difficulty_ru_to_lms_id(row, difficulties_meta)
     course_id = map_quiz_title_to_course_id(row, courses_meta)
-
+    log.debug(
+        "Маппинг строки question_code=%r -> course_id=%s, difficulty_id=%s, qtype=%s",
+        row.question_code,
+        course_id,
+        difficulty_id,
+        qtype,
+    )
     task_content = build_task_content(row, qtype, settings)
     solution_rules = build_solution_rules(row, qtype)
 
@@ -395,5 +422,11 @@ def row_to_task_upsert_item(
         "solution_rules": solution_rules,
         "max_score": max_score,
     }
-
+    log.debug(
+        "Сформирован TaskUpsertItem для question_code=%r (course_id=%s, difficulty_id=%s, max_score=%s)",
+        row.question_code,
+        course_id,
+        difficulty_id,
+        max_score,
+    )
     return item
