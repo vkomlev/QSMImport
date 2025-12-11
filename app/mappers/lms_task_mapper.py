@@ -1,153 +1,126 @@
 # app/mappers/lms_task_mapper.py
+
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import logging
-import re
-from typing import Any, Dict, List, Optional
 
 from app.config import Settings
-from app.models.question_input import QuestionInputRow
 from app.models.enums import QuestionType
-from app.utils import parsing, text
+from app.models.question_input import QuestionInputRow
+from app.utils.parsing import parse_correct_list, parse_variants_block
+from app.utils.text import add_input_link_to_title, normalize
 
 log = logging.getLogger(__name__)
 
 
-# ------------------------------
-# Вспомогательные функции
-# ------------------------------
+# --- Вспомогательные структуры ------------------------------------------------
 
-def _map_qtype(raw: str) -> QuestionType:
+
+@dataclass
+class ChoiceOption:
+    id: str          # "A", "B", ...
+    text: str        # текст варианта
+    is_correct: bool
+    points: float    # "сырой" вес варианта (из правой части || или 1)
+
+
+# --- Построение TaskContent ---------------------------------------------------
+
+
+def _build_stem_text(row: QuestionInputRow, settings: Settings) -> str:
     """
-    Преобразует строковый код типа задания в QuestionType.
-    Бросает ValueError при некорректном коде.
+    Формируем основной текст задания (TaskContent.stem).
+
+    Логика:
+      - нормализуем текст;
+      - по флагу prepend_input_link добавляем блок "Входные данные" внутрь формулировки;
+      - оставляем без HTML-структуры, чистый markdown/текст.
     """
-    try:
-        qtype = QuestionType(raw)
-        log.debug("Маппинг типа задания: raw=%r -> %s", raw, qtype)
-        return qtype
-    except ValueError as e:
-        log.error("Неизвестный тип задания qtype_code=%r", raw)
-        raise ValueError(f"Unsupported question type code: {raw!r}") from e
+    base = normalize(row.text or "")
 
-
-def _choice_base_type(qtype: QuestionType) -> str:
-    """
-    Возвращает базовый type для task_content/solution_rules
-    по подтипу QuestionType.
-    """
-    if qtype in (QuestionType.SC, QuestionType.MC):
-        return "choice"
-    if qtype in (QuestionType.SA, QuestionType.SA_COM):
-        return "short_answer"
-    if qtype is QuestionType.TA:
-        return "text"
-    # На всякий случай
-    return "unknown"
-
-
-def _build_options_and_scoring_for_choice(
-    row: QuestionInputRow,
-    qtype: QuestionType,
-) -> Dict[str, Any]:
-    """
-    Формирует структуру options[] и scoring для SC/MC,
-    а также вычисляет max_score.
-    """
-    variants = parsing.parse_variants_block(row.variants_and_points)
-    correct_list_raw = parsing.parse_correct_list(row.correct_answer)
-    correct_set_norm = {text.normalize(c) for c in correct_list_raw}
-
-    options: List[Dict[str, Any]] = []
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-    max_score = 0.0
-
-    for idx, (opt_text, raw_points) in enumerate(variants):
-        opt_norm = text.normalize(opt_text)
-        is_correct = opt_norm in correct_set_norm
-
-        # Если баллы не заданы (0 или пусто) и вариант правильный — даем 1
-        points = float(raw_points)
-        if is_correct and (points == 0.0):
-            points = 1.0
-
-        if is_correct:
-            max_score += points
-
-        opt_id = letters[idx] if idx < len(letters) else f"opt_{idx+1}"
-
-        options.append(
-            {
-                "id": opt_id,
-                "text": opt_text,
-                "order": idx + 1,
-                "is_correct": is_correct,
-                "points": points,
-            }
+    if settings.prepend_input_link and row.input_link:
+        # ВАЖНО: вызываем позиционно, без именованных аргументов
+        stem = add_input_link_to_title(
+            base,
+            row.input_link,
+            settings.input_link_label,
         )
+    else:
+        stem = base
 
-    if qtype == QuestionType.SC:
-        scoring = {
-            "mode": "all_or_nothing",
-            "partial_allowed": False,
-            "penalize_wrong": False,
-        }
-    else:  # MC
-        scoring = {
-            "mode": "sum",
-            "partial_allowed": True,
-            "penalize_wrong": False,
-        }
+    return stem
+
+
+def _build_media(row: QuestionInputRow) -> Optional[Dict[str, Any]]:
+    """
+    TaskMedia по схеме TaskMedia из OpenAPI. 
+
+    media = {
+        "image_url": ... | None,
+        "audio_url": ... | None,
+        "video_url": ... | None,
+    }
+    """
+    # В исходной таблице точно есть video_url, медиа-URL (картинка)
+    image_url = getattr(row, "media_url", None) or None
+    video_url = (row.video_url or "").strip() or None
+
+    if not image_url and not video_url:
+        return None
 
     return {
-        "options": options,
-        "scoring": scoring,
-        "max_score": max_score,
+        "image_url": image_url,
+        "audio_url": None,
+        "video_url": video_url,
     }
 
 
-def _build_accepted_answers_for_short_answer(row: QuestionInputRow) -> List[Dict[str, Any]]:
+def _parse_choice_options(
+    row: QuestionInputRow,
+    qtype: QuestionType,
+) -> Tuple[List[ChoiceOption], List[str]]:
     """
-    Формирует accepted_answers для SA / SA_COM.
-    Поддерживает exact и regex через префикс 're:'.
+    Разобрать блок «Варианты ответа и баллы» и «Правильный ответ» для SC/MC.
+
+    Возвращает:
+      - список ChoiceOption (уже с буквенными id "A", "B", ...),
+      - список правильных id (["A", "C"] и т.п.).
     """
-    answers_raw = parsing.parse_correct_list(row.correct_answer)
-    accepted: List[Dict[str, Any]] = []
+    # Табличные варианты вида "Текст||0.5" построчно
+    raw_variants = row.variants_and_points or ""
+    parsed = parse_variants_block(raw_variants)
 
-    for raw in answers_raw:
-        s = raw.strip()
-        if not s:
-            continue
+    # parsed: list[tuple[str, Optional[float]]]
+    # Если баллы не заданы -> будем считать points=1 для всех правильных
+    options: List[ChoiceOption] = []
 
-        if s.lower().startswith("re:"):
-            pattern = s[3:]
-            match_type = "regex"
-
-            try:
-                re.compile(pattern)
-            except re.error as e:
-                log.warning("Некорректная regex в правильном ответе %r: %s", raw, e)
-                # можно либо пропустить, либо добавить как exact; выберем пропуск
-                continue
-        else:
-            pattern = s
-            match_type = "exact"
-
-        accepted.append(
-            {
-                "pattern": pattern,
-                "points": 1.0,
-                "match_type": match_type,
-            }
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for idx, (text, pts) in enumerate(parsed):
+        option_id = letters[idx]
+        options.append(
+            ChoiceOption(
+                id=option_id,
+                text=normalize(text),
+                is_correct=False,   # пока не знаем, заполним ниже
+                points=float(pts) if pts is not None else 0.0,
+            )
         )
 
-    return accepted
+    # Правильные ответы в таблице — текст вариантов через ';'
+    # Маппим по тексту, чтобы не зависеть от позиции
+    correct_texts = [normalize(t) for t in parse_correct_list(row.correct_answer)]
 
+    correct_ids: List[str] = []
+    for opt in options:
+        if opt.text in correct_texts:
+            opt.is_correct = True
+            correct_ids.append(opt.id)
 
-# ------------------------------
-# Публичные функции маппера
-# ------------------------------
+    return options, correct_ids
+
 
 def build_task_content(
     row: QuestionInputRow,
@@ -155,158 +128,304 @@ def build_task_content(
     settings: Settings,
 ) -> Dict[str, Any]:
     """
-    Собирает JSON-структуру task_content для LMS из одной строки Google Sheets.
+    Построить JSON в формате TaskContent по схеме бекенда. 
+
+    Обязательные поля:
+      - type: "SC"|"MC"|"SA"|"SA_COM"|"TA"
+      - stem: формулировка задания
+
+    Дополнительные:
+      - code: внешний код задачи (совпадает с external_uid)
+      - title: можно взять тему / краткий заголовок
+      - prompt: текст подсказки
+      - media: TaskMedia
+      - options: список TaskOption для SC/MC
+      - tags: пока пустой список
+      - difficulty_code, course_uid: не заполняем, так как у нас есть id.
     """
-    base_type = _choice_base_type(qtype)
+    stem = _build_stem_text(row, settings)
+    media = _build_media(row)
 
-    # Текст условия + добавление ссылки, если включено в настройках
-    statement_text = row.text
-    if settings.prepend_input_link and row.input_link:
-        statement_text = text.add_input_link_to_title(
-            title=row.text,
-            link=row.input_link,
-            label=settings.input_link_label,
-        )
+    # Заголовок можно взять как тему или укороченный stem
+    title = row.quiz_title or stem[:120]
 
-    statement: Dict[str, Any] = {
-        "text": statement_text,
-    }
-    if row.input_link:
-        statement["input_link"] = {
-            "url": row.input_link,
-            "label": settings.input_link_label,
-        }
-
-    task_content: Dict[str, Any] = {
-        "version": 1,
-        "type": base_type,
-        "subtype": qtype.value,
-        "statement": statement,
-        "hint": row.hint or None,
-        "attachments": {},
-        "ui": {},
+    content: Dict[str, Any] = {
+        "type": qtype.value,
+        "code": (row.question_code or "").strip() or None,
+        "title": title,
+        "stem": stem,
+        "prompt": (row.hint or "").strip() or None,
+        "media": media,
+        "options": None,          # ниже заполним для SC/MC
         "tags": [],
+        "difficulty_code": None,
+        "course_uid": None,
     }
 
-    # Видеоразбор
-    if row.video_url:
-        task_content["attachments"]["video"] = [
-            {"url": row.video_url, "label": "Видеоразбор"}
+    if qtype in (QuestionType.SC, QuestionType.MC):
+        options, _ = _parse_choice_options(row, qtype)
+
+        content["options"] = [
+            {
+                "id": opt.id,
+                "text": opt.text,
+                "explanation": None,
+                "is_active": True,
+            }
+            for opt in options
         ]
-
-    # UI-настройки
-    if qtype in (QuestionType.SC, QuestionType.MC):
-        task_content["ui"] = {
-            "shuffle_options": True,
-            "layout": "vertical",
-            "show_hint_button": bool(row.hint),
-        }
     else:
-        task_content["ui"] = {
-            "show_hint_button": bool(row.hint),
+        content["options"] = None
+
+    log.debug(
+        "build_task_content: external_uid=%r, type=%s",
+        row.question_code,
+        qtype.value,
+    )
+
+    return content
+
+
+# --- Построение SolutionRules -------------------------------------------------
+
+
+def _build_penalties() -> Dict[str, int]:
+    """
+    PenaltiesRules по умолчанию. 
+    """
+    return {
+        "wrong_answer": 0,
+        "missing_answer": 0,
+        "extra_wrong_mc": 0,
+    }
+
+
+def _build_solution_for_choice(
+    row: QuestionInputRow,
+    qtype: QuestionType,
+) -> Tuple[Dict[str, Any], int]:
+    """
+    SolutionRules для SC/MC.
+
+    Возвращает:
+      - dict SolutionRules (без short_answer/text_answer),
+      - max_score.
+    """
+    options, correct_ids = _parse_choice_options(row, qtype)
+
+    # Если баллы не заданы — points=1 для всех правильных.
+    # Если заданы — суммируем points по правильным.
+    has_explicit_points = any(opt.points > 0 for opt in options)
+    if not has_explicit_points:
+        for opt in options:
+            if opt.is_correct:
+                opt.points = 1.0
+
+    max_score = int(round(sum(opt.points for opt in options if opt.is_correct)))
+
+    if qtype is QuestionType.SC:
+        scoring_mode = "all_or_nothing"
+    else:
+        scoring_mode = "partial"
+
+    solution: Dict[str, Any] = {
+        "max_score": max_score,
+        "scoring_mode": scoring_mode,
+        "auto_check": True,
+        "manual_review_required": False,
+        "correct_options": correct_ids,
+        "partial_rules": [],    # простая схема — по correct_options
+        "short_answer": None,
+        "text_answer": None,
+        "penalties": _build_penalties(),
+    }
+
+    log.debug(
+        "_build_solution_for_choice: external_uid=%r, type=%s, max_score=%s, correct=%s",
+        row.question_code,
+        qtype.value,
+        max_score,
+        correct_ids,
+    )
+
+    return solution, max_score
+
+
+def _build_short_answer_rules(
+    row: QuestionInputRow,
+    settings: Optional[Settings],
+) -> Tuple[Dict[str, Any], int, str, bool, bool]:
+    """
+    Построить ShortAnswerRules + max_score для SA/SA_COM. 
+
+    Возвращает:
+      - short_answer_rules dict,
+      - max_score (int),
+      - scoring_mode ("all_or_nothing"/"partial"),
+      - auto_check (bool),
+      - manual_review_required (bool).
+    """
+    raw = (row.correct_answer or "").strip()
+
+    # Если settings не передали – пусть будет дефолт 1 балл
+    default_score = int(
+        round(getattr(settings, "default_points_short_answer", 1.0))
+    )
+
+    normalization = ["trim", "lower", "collapse_spaces"]
+
+    if not raw:
+        # Нет эталона – автоматом не проверяем
+        short_answer = {
+            "normalization": normalization,
+            "accepted_answers": [],
+            "use_regex": False,
+            "regex": None,
         }
+        return short_answer, default_score, "all_or_nothing", False, True
 
-    # Для SC/MC добавляем options (без is_correct/points — это в solution_rules)
-    if qtype in (QuestionType.SC, QuestionType.MC):
-        variants = parsing.parse_variants_block(row.variants_and_points)
-        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        options_for_content: List[Dict[str, Any]] = []
-
-        for idx, (opt_text, _pts) in enumerate(variants):
-            opt_id = letters[idx] if idx < len(letters) else f"opt_{idx+1}"
-            options_for_content.append(
-                {
-                    "id": opt_id,
-                    "text": opt_text,
-                    "order": idx + 1,
-                }
-            )
-
-        task_content["options"] = options_for_content
-
-    # Формат ответа для SA/SA_COM/TA
-    if qtype in (QuestionType.SA, QuestionType.SA_COM):
-        task_content["answer_format"] = {
-            "placeholder": "Введите краткий ответ",
-            "comment_required": qtype is QuestionType.SA_COM,
-            "comment_multiline": True,
+    # Regex режим: префикс "re:"
+    if raw.startswith("re:"):
+        pattern = raw[3:].strip()
+        short_answer = {
+            "normalization": [],
+            "accepted_answers": [],
+            "use_regex": True,
+            "regex": pattern,
         }
-    elif qtype is QuestionType.TA:
-        task_content["answer_format"] = {
-            "placeholder": "Опишите решение подробно",
-            "min_length": 0,
-            "max_length": 5000,
-        }
+        # regex — всё или ничего
+        return short_answer, default_score, "all_or_nothing", True, False
 
-    return task_content
+    # Иначе — список допустимых строк через ';'
+    parts = [p.strip() for p in raw.split(";") if p.strip()]
+    accepted = [
+        {
+            "value": p,
+            "score": default_score,
+        }
+        for p in parts
+    ]
+    short_answer = {
+        "normalization": normalization,
+        "accepted_answers": accepted,
+        "use_regex": False,
+        "regex": None,
+    }
+
+    # Если несколько вариантов с одинаковыми баллами — считаем all_or_nothing
+    scoring_mode = "all_or_nothing"
+    auto_check = True
+    manual_review_required = False
+
+    return short_answer, default_score, scoring_mode, auto_check, manual_review_required
+
+
+def _build_solution_for_ta() -> Tuple[Dict[str, Any], int]:
+    """
+    SolutionRules для развёрнутого ответа (TA). 
+
+    Логика:
+      - только ручная проверка,
+      - простая рубрика с одним критерием "content".
+    """
+    max_score = 5
+
+    text_answer = {
+        "auto_check": False,
+        "rubric": [
+            {
+                "id": "content",
+                "title": "Содержание ответа",
+                "max_score": max_score,
+            }
+        ],
+    }
+
+    solution: Dict[str, Any] = {
+        "max_score": max_score,
+        "scoring_mode": "custom",
+        "auto_check": False,
+        "manual_review_required": True,
+        "correct_options": [],
+        "partial_rules": [],
+        "short_answer": None,
+        "text_answer": text_answer,
+        "penalties": _build_penalties(),
+    }
+
+    return solution, max_score
 
 
 def build_solution_rules(
     row: QuestionInputRow,
     qtype: QuestionType,
+    settings: Optional[Settings] = None,
 ) -> Dict[str, Any]:
     """
-    Собирает JSON-структуру solution_rules для LMS.
+    Построить JSON в формате SolutionRules по схеме бекенда. 
     """
-    base_type = _choice_base_type(qtype)
-
-    # SC / MC: выбор вариантов
     if qtype in (QuestionType.SC, QuestionType.MC):
-        data = _build_options_and_scoring_for_choice(row, qtype)
-        options = data["options"]
-        scoring = data["scoring"]
-        max_score = data["max_score"]
+        solution, _ = _build_solution_for_choice(row, qtype)
+        return solution
 
-        return {
-            "version": 1,
-            "type": base_type,
-            "subtype": qtype.value,
-            "max_score": max_score,
-            "scoring": scoring,
-            # В rules храним полную информацию по вариантам
-            "options": [
-                {
-                    "id": opt["id"],
-                    "is_correct": opt["is_correct"],
-                    "points": opt["points"],
-                }
-                for opt in options
-            ],
-        }
-
-    # SA / SA_COM: короткий ответ
     if qtype in (QuestionType.SA, QuestionType.SA_COM):
-        accepted_answers = _build_accepted_answers_for_short_answer(row)
+        short_answer, max_score, scoring_mode, auto_check, manual_review_required = (
+            _build_short_answer_rules(row, settings)
+        )
 
-        return {
-            "version": 1,
-            "type": base_type,
-            "subtype": qtype.value,
-            "max_score": 1.0,
-            "scoring": {
-                "mode": "first_match",
-                "case_sensitive": False,
-                "trim_spaces": True,
-                "normalize_spaces": True,
-            },
-            "accepted_answers": accepted_answers,
+        # Для SA_COM требуем ручную дооценку комментария
+        if qtype is QuestionType.SA_COM:
+            manual_review_required = True
+
+        solution = {
+            "max_score": max_score,
+            "scoring_mode": scoring_mode,
+            "auto_check": auto_check,
+            "manual_review_required": manual_review_required,
+            "correct_options": [],
+            "partial_rules": [],
+            "short_answer": short_answer,
+            "text_answer": None,
+            "penalties": _build_penalties(),
         }
 
-    # TA: развёрнутый ответ, ручная проверка
+        log.debug(
+            "build_solution_rules(SA*): external_uid=%r, max_score=%s, mode=%s",
+            row.question_code,
+            max_score,
+            scoring_mode,
+        )
+        return solution
+
     if qtype is QuestionType.TA:
-        return {
-            "version": 1,
-            "type": base_type,
-            "subtype": qtype.value,
-            "max_score": 5.0,
-            "scoring": {
-                "mode": "manual",
-                "rubric": [],
-            },
-        }
+        solution, _ = _build_solution_for_ta()
+        log.debug(
+            "build_solution_rules(TA): external_uid=%r, max_score=%s",
+            row.question_code,
+            solution["max_score"],
+        )
+        return solution
 
-    # На всякий случай
-    raise ValueError(f"Unsupported question type in build_solution_rules: {qtype!r}")
+    # На всякий случай: неизвестный тип — пустые правила с max_score=0
+    log.warning(
+        "build_solution_rules: неизвестный тип %r для external_uid=%r",
+        qtype,
+        row.question_code,
+    )
+    return {
+        "max_score": 0,
+        "scoring_mode": "all_or_nothing",
+        "auto_check": False,
+        "manual_review_required": True,
+        "correct_options": [],
+        "partial_rules": [],
+        "short_answer": None,
+        "text_answer": None,
+        "penalties": _build_penalties(),
+    }
+
+
+# --- Маппинг сложностей и курсов ---------------------------------------------
 
 
 def map_difficulty_ru_to_lms_id(
@@ -314,33 +433,19 @@ def map_difficulty_ru_to_lms_id(
     meta_difficulties: List[Dict[str, Any]],
 ) -> int:
     """
-    Сопоставляет row.difficulty_ru с name_ru в meta_difficulties.
-    При отсутствии совпадения возвращает id сложности Easy (code='Easy') или 2.
+    Поиск difficulty_id по русскому названию сложности (name_ru).
+    Если не нашли — используем id для 'Easy' (2) как дефолт.
     """
-    target = (row.difficulty_ru or "").strip().lower()
-    log.debug(
-        "Маппинг сложности: source=%r (нормализовано=%r)", row.difficulty_ru, target
-    )
+    name = (row.difficulty_ru or "").strip()
 
     for d in meta_difficulties:
-        name_ru = (d.get("name_ru") or "").strip().lower()
-        if name_ru == target:
+        if (d.get("name_ru") or "").strip() == name:
             return int(d["id"])
 
-    # Fallback: ищем code == 'Easy'
-    for d in meta_difficulties:
-        if (d.get("code") or "").strip() == "Easy":
-            log.warning(
-                "Сложность %r не найдена, использую fallback 'Easy' (id=%s)",
-                row.difficulty_ru,
-                d.get("id"),
-            )
-            return int(d["id"])
-
-    # Второй fallback — просто 2, как ты указал
+    # дефолт: Easy => id=2 (как мы договорились)
     log.warning(
-        "Сложность %r не найдена и 'Easy' отсутствует в meta, использую id=2 по умолчанию",
-        row.difficulty_ru,
+        "Не удалось сопоставить сложность %r, используем дефолт difficulty_id=2",
+        name,
     )
     return 2
 
@@ -350,34 +455,31 @@ def map_quiz_title_to_course_id(
     meta_courses: List[Dict[str, Any]],
 ) -> int:
     """
-    Находит course_id в LMS по коду курса из строки Google Sheets (row.course_code).
+    Маппинг курса по коду/uid из таблицы.
 
-    В meta_courses ожидается поле 'course_uid', по которому и маппим:
-        row.course_code == course['course_uid'].
+    Приоритет:
+      1) row.course_code -> course.course_uid (если совпадает),
+      2) если найден ровно один курс в meta, берём его id,
+      3) иначе — ошибка.
     """
     code = (row.course_code or "").strip()
-    log.debug("Маппинг курса: course_code=%r", code)
-    for c in meta_courses:
-        uid = (c.get("course_uid") or "").strip()
-        if uid == code:
-            log.debug(
-                "Курс найден: course_code=%r совпал с course_uid=%r (id=%s, title=%r)",
-                code,
-                uid,
-                c.get("id"),
-                c.get("title"),
-            )
-            return int(c["id"])
 
-    log.error(
-        "Не найден курс для course_code=%r в meta_courses (всего курсов=%d)",
-        code,
-        len(meta_courses),
-    )
+    if code:
+        for c in meta_courses:
+            if (c.get("course_uid") or "").strip() == code:
+                return int(c["id"])
+
+    if len(meta_courses) == 1:
+        return int(meta_courses[0]["id"])
+
+    titles = ", ".join(f"{c['id']}:{c['title']}" for c in meta_courses)
     raise ValueError(
-        f"Не найден курс для course_code={code!r} в meta_courses. "
-        "Проверьте 'Код курса' в таблице и настройки LMS."
+        f"Не удалось сопоставить курс по коду {code!r} "
+        f"и нельзя выбрать единственный курс из meta: {titles}"
     )
+
+
+# --- Главный маппер в TaskUpsertItem -----------------------------------------
 
 
 def row_to_task_upsert_item(
@@ -386,47 +488,54 @@ def row_to_task_upsert_item(
     settings: Settings,
 ) -> Dict[str, Any]:
     """
-    Преобразует одну строку Google Sheets в dict формата TaskUpsertItem
-    для bulk-upsert в LMS.
+    Собрать dict в формате TaskUpsertItem для /api/v1/tasks/bulk-upsert.
+
+    Структура:
+      - external_uid: str
+      - course_id: int
+      - difficulty_id: int
+      - task_content: TaskContent
+      - solution_rules: SolutionRules | None
+      - max_score: int | None
     """
-    if not row.question_code:
-        log.error("Пустой 'Код вопроса' (question_code) в строке Google Sheets")
-        raise ValueError("Пустой 'Код вопроса' (question_code) в строке Google Sheets")
+    raw_qtype = (row.qtype_code or "").strip().upper()
+    try:
+        qtype = QuestionType(raw_qtype)
+    except Exception as e:
+        log.error(
+            "Неизвестный тип задания qtype_code=%r для question_code=%r: %s",
+            row.qtype_code,
+            row.question_code,
+            e,
+        )
+        raise
 
-    qtype = _map_qtype(row.qtype_code)
+    course_id = map_quiz_title_to_course_id(row, meta["courses"])
+    difficulty_id = map_difficulty_ru_to_lms_id(row, meta["difficulties"])
 
-    difficulties_meta = meta.get("difficulties", []) or []
-    courses_meta = meta.get("courses", []) or []
-
-    difficulty_id = map_difficulty_ru_to_lms_id(row, difficulties_meta)
-    course_id = map_quiz_title_to_course_id(row, courses_meta)
-    log.debug(
-        "Маппинг строки question_code=%r -> course_id=%s, difficulty_id=%s, qtype=%s",
-        row.question_code,
-        course_id,
-        difficulty_id,
-        qtype,
-    )
     task_content = build_task_content(row, qtype, settings)
-    solution_rules = build_solution_rules(row, qtype)
+    solution_rules = build_solution_rules(row, qtype, settings)
 
-    max_score: Optional[float] = None
-    if isinstance(solution_rules, dict):
-        max_score = solution_rules.get("max_score")
+    max_score = int(solution_rules.get("max_score", 0))
 
-    item: Dict[str, Any] = {
-        "external_uid": row.question_code,
+    item = {
+        "external_uid": (row.question_code or "").strip() or None,
         "course_id": course_id,
         "difficulty_id": difficulty_id,
         "task_content": task_content,
         "solution_rules": solution_rules,
         "max_score": max_score,
     }
-    log.debug(
-        "Сформирован TaskUpsertItem для question_code=%r (course_id=%s, difficulty_id=%s, max_score=%s)",
-        row.question_code,
+
+    log.info(
+        "row_to_task_upsert_item: external_uid=%r, type=%s, course_id=%s, "
+        "difficulty_id=%s, max_score=%s",
+        item["external_uid"],
+        qtype.value,
         course_id,
         difficulty_id,
         max_score,
     )
+
     return item
+

@@ -14,7 +14,6 @@ from app.datasources.google_sheets import GoogleSheetsSource
 from app.datasources.lms_api import LmsApiClient
 from app.mappers.lms_task_mapper import row_to_task_upsert_item
 from app.services.lms_import_service import LmsImportService
-from app.logging_config import setup_logging
 
 log = logging.getLogger(__name__)
 app = typer.Typer(add_completion=False)
@@ -117,7 +116,7 @@ def dry_run_lms_import(
     settings = Settings()
     setup_logging(settings)
     log.info("Запуск команды dry_run_lms_import (limit=%d)", limit)
-    # Проверка настроек LMS
+
     if not settings.lms_api_base_url:
         typer.echo("❌ lms_api_base_url не задан в настройках (.env).")
         raise typer.Exit(code=1)
@@ -127,7 +126,6 @@ def dry_run_lms_import(
 
     typer.echo(f"Используем LMS API: {settings.lms_api_base_url}")
 
-    # Источник данных Google Sheets
     src = GoogleSheetsSource(
         spreadsheet_id=settings.gsheets_spreadsheet_id or "",
         worksheet_name=settings.gsheets_worksheet_name,
@@ -141,12 +139,10 @@ def dry_run_lms_import(
 
     rows_sample = rows[:limit]
 
-    # Клиент LMS API
     lms_client = LmsApiClient(settings)
 
     typer.echo("Запрашиваю метаданные задач (difficulties, courses, ...) из LMS...")
     meta = lms_client.get_tasks_meta()
-
     typer.echo(
         f"Получены метаданные: difficulties={len(meta.get('difficulties', []))}, "
         f"courses={len(meta.get('courses', []))}"
@@ -169,20 +165,20 @@ def dry_run_lms_import(
             typer.echo(f"❌ Ошибка маппинга row_to_task_upsert_item: {e}")
             continue
 
-        typer.echo("Сформированный TaskUpsertItem:")
-        typer.echo(json.dumps(upsert_item, ensure_ascii=False, indent=2))
-
         validate_payload = {
             "task_content": upsert_item["task_content"],
             "solution_rules": upsert_item["solution_rules"],
             "max_score": upsert_item["max_score"],
             "difficulty_id": upsert_item["difficulty_id"],
             "course_id": upsert_item["course_id"],
+            "course_code": row.course_code.strip() if row.course_code else None,
             "external_uid": upsert_item["external_uid"],
         }
 
-        typer.echo("\nРезультат валидации через /api/v1/tasks/validate:")
+        typer.echo("Сформированный TaskUpsertItem:")
+        typer.echo(json.dumps(upsert_item, ensure_ascii=False, indent=2))
 
+        typer.echo("\nРезультат валидации через /api/v1/tasks/validate:")
         try:
             validation_result = lms_client.validate_task(validate_payload)
             typer.echo(json.dumps(validation_result, ensure_ascii=False, indent=2))
@@ -191,6 +187,7 @@ def dry_run_lms_import(
 
     typer.echo("\n✅ Dry-run завершён.")
     log.info("Команда dry_run_lms_import завершена")
+
 
 def main():
     app()
