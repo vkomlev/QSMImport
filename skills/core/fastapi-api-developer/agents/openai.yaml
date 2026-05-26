@@ -1,0 +1,4 @@
+interface:
+  display_name: "FastAPI API Developer"
+  short_description: "Implement FastAPI changes with DB and log checks"
+  default_prompt: "Implement or debug this FastAPI API change with MCP-aware DB checks, contract guards, smoke tests, and review artifacts."
