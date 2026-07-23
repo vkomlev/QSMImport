@@ -5,3 +5,7 @@
 gscapi-390409-4a9cf4824d2c.json
 QSMImport.zip
 .vscode/launch.json
+
+# Claude Code / Cursor: локальные настройки агентов, не репозиторий.
+.claude/
+.cursor/
