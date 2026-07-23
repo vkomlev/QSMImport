@@ -39,6 +39,8 @@ This catalog tracks the managed Codex Booster skill set and nearby runtime capab
 - `digital-copywriter`: Russian digital content for TG, VK, site, email, and reality/process formats.
 - `smm-specialist`: TG/VK strategy, content calendars, warmup chains, and attraction tactics.
 - `methodist`: IT course modules, learning plans, assignments, rubrics, and LMS/WP export-ready projections.
+- `naive-learner-review`: review ready courses through the actual target audience, collecting naive questions by content atoms, visual/navigation issues, root causes, and fix briefs.
+- `expert-course-review`: audit ready courses against an expert pedagogy rubric with grade and prioritized fixes.
 - `travel-copywriter`: Russian travel content for posts, blogs, guides, and itinerary-style materials.
 
 ## Nearby Non-Managed Skills
@@ -50,5 +52,6 @@ This catalog tracks the managed Codex Booster skill set and nearby runtime capab
 - Use `codex-booster import-claude` for verified Claude practices that should become Codex source, runtime, or project behavior.
 - Use [skill-standard.md](skill-standard.md) for Codex skill shape; do not copy Claude-only `allowed-tools`.
 - Use [codex-project-binding.md](codex-project-binding.md) for project setup, trust, MCP, runtime mirrors, and `AGENTS.md` mapping.
+- Use [skill-routing-registry.md](skill-routing-registry.md) when consulting Claude `skill_routing.json` as read-only route advice; it is not Codex enforcement.
 - Use [browser-gstack-mapping.md](browser-gstack-mapping.md) for Claude/gstack workflow names that map to Codex Browser, QA, review, and release skills.
 - Use [browser-qa-runtime.md](/d:/Work/IDE_booster/Docs/ai-booster/browser-qa-runtime.md) for Browser plugin QA sessions, cookie/session handling, screenshot evidence, local app smoke, and manual MFA handoff.
