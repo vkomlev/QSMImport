@@ -41,14 +41,14 @@ class LmsApiClient:
     ) -> Response:
         """
         Унифицированный метод запросов.
-        Добавляет api_key в query-параметры.
+        Передаёт сервисный ключ заголовком X-API-Key (tsk-595: в query он оседал
+        открытым текстом в access-логе nginx, где маскировки нет).
         Логирует запрос и ответ.
         """
         url = f"{self.base_url}{path}"
 
         params = params.copy() if params else {}
-        if self.api_key:
-            params["api_key"] = self.api_key
+        headers = {"X-API-Key": self.api_key} if self.api_key else {}
 
         self.log.debug("HTTP %s %s params=%s json=%s", method, url, params, json)
 
@@ -56,6 +56,7 @@ class LmsApiClient:
             method=method,
             url=url,
             params=params,
+            headers=headers,
             json=json,
             timeout=self.timeout,
         )
